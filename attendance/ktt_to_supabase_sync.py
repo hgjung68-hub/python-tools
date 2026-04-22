@@ -104,13 +104,42 @@ def save_sync_times(times_dict):
 #  MDB 연결
 # ─────────────────────────────────────────────
 def get_mdb_connection(mdb_path):
+    last_err = None
     for pwd in MDB_PWD_CANDIDATES:
         try:
-            conn_str = f"Driver={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};PWD={pwd};"
-            return pyodbc.connect(conn_str, timeout=5), None
-        except:
+            conn_str = (
+                f"Driver={{Microsoft Access Driver (*.mdb, *.accdb)}};"
+                f"DBQ={mdb_path};PWD={pwd};"
+            )
+            conn = pyodbc.connect(conn_str, timeout=5)
+            return conn, None
+        except Exception as e:
+            last_err = e
             continue
-    return None, "MDB 연결 실패 (경로/암호 확인)"
+    return None, f"MDB 연결 실패 (경로/암호 확인): {last_err}"
+
+# ─────────────────────────────────────────────
+#  cursor 안전 조회 헬퍼
+# ─────────────────────────────────────────────
+def fetch_all(conn, query):
+    """cursor를 명시적으로 열고 닫으며 결과 반환"""
+    cur = conn.cursor()
+    try:
+        cur.execute(query)
+        return cur.fetchall()
+    finally:
+        cur.close()
+
+def read_sql_safe(conn, query):
+    """pd.read_sql 대신 cursor를 직접 제어하여 DataFrame 반환"""
+    cur = conn.cursor()
+    try:
+        cur.execute(query)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return pd.DataFrame.from_records(rows, columns=cols)
+    finally:
+        cur.close()
  
 # ─────────────────────────────────────────────
 #  동기화 로직 (백그라운드 스레드)
@@ -157,7 +186,9 @@ def run_sync(mdb_path, supabase_url, supabase_key, log_queue):
               AND str_accTerminalPlace IS NOT NULL
               AND Len(str_workempNum) = 7
         """
-        places = [row[0] for row in conn.cursor().execute(place_query).fetchall()]
+        # cursor 명시적 해제
+        places = [row[0] for row in fetch_all(conn, place_query)]
+
         log(f"활성 리더기 {len(places)}개 탐지: {places}")
         update_stat("readers", str(places))
  
@@ -179,7 +210,9 @@ def run_sync(mdb_path, supabase_url, supabase_key, log_queue):
                   AND str_accTerminalPlace = '{place}'
                   AND Len(str_workempNum) = 7
             """
-            df_part = pd.read_sql(query, conn)
+            # pd.read_sql → cursor 직접 제어
+            df_part = read_sql_safe(conn, query)
+
             if not df_part.empty:
                 all_processed.append(df_part)
                 last_sync_times[place.lower()] = df_part["date_Attestation"].max().strftime("%Y-%m-%d %H:%M:%S")
@@ -254,6 +287,11 @@ def run_sync(mdb_path, supabase_url, supabase_key, log_queue):
         log(f"오류: {e}", "ERROR")
         update_stat("status", "오류")
     finally:
+        # autocommit 상태 확인 후 rollback으로 잔여 트랜잭션 정리
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         conn.close()
  
 # ─────────────────────────────────────────────
@@ -623,8 +661,17 @@ class KTTSyncApp(tk.Tk):
     def on_close(self):
         if self.timer_job:
             self.after_cancel(self.timer_job)
+            self.timer_job = None
+
+        # 동기화 실행 중이면 완료 대기 안내
+        if self.is_running:
+            if not messagebox.askyesno(
+                "종료 확인",
+                "동기화가 진행 중입니다.\n강제 종료하면 MDB 락 파일이 잔류할 수 있습니다.\n그래도 종료하시겠습니까?"
+            ):
+                return
+            
         self.destroy()
- 
  
 if __name__ == "__main__":
     app = KTTSyncApp()
